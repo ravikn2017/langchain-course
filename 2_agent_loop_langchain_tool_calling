@@ -1,0 +1,190 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import ollama
+
+from langsmith import traceable
+
+MAX_ITERATIONS = 10
+MODEL = "gemma4:latest"
+
+@traceable(run_type="tool")
+def get_product_price(product: str) -> float | str:
+    """Lookup the price of the product from the catalog.
+    Valid products: laptops, desktops, monitors (singular forms like 'laptop' also work)."""
+    print(f"  >> Executing get_product_price(product='{product}')")
+    prices = {"laptops": 1000.0, "desktops": 1500.0, "monitors": 300.0}
+    key = product.strip().lower()
+    if not key.endswith("s"):
+        key = key + "s"
+    if key not in prices:
+        return f"Error: product '{product}' not found. Valid products: laptops, desktops, monitors"
+    return prices[key]
+
+@traceable(run_type="tool")
+def apply_discount(price: float, discount_tier: str) -> float:
+    """Apply a discount tier to the price and return the final price.
+    Available discount tiers: gold, silver, bronze"""
+    print(f"   >> Executing apply_discount(price='{price}', discount_tier='{discount_tier}')")
+    discount_percentags={"gold": 23, "silver": 12, "bronze": 5}
+    discount = discount_percentags.get(discount_tier, 0)
+    return round(price * (1 - discount / 100), 2)
+
+#Difference 2: Without @tool, we must MANUALLY define the JSON schema for each function
+#This is exactly what Langchain's @tool decorator generates automatically
+#from the function's type hints and docstring.
+tools_for_llm = [
+  {
+    "type": "function",
+    "function": {
+      "name": "get_product_price",
+      "description": "Look up the price of a product in the catalog",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "product": {
+            "type": "string",
+            "description": "The product name (e.g. 'laptop', 'desktop', 'monitor')"
+          }
+        },
+        "required": ["product"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "apply_discount",
+      "description": "Apply a discount to a price and return the final price. Available discount tiers: gold, silver, bronze",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "price": {
+            "type": "number",
+            "description": "The original price of the product"
+          },
+          "discount_tier": {
+            "type": "string",
+            "description": "The discount tier to apply (gold, silver, bronze)"
+          }
+        },
+        "required": ["price", "discount_tier"]
+      }
+    }
+  }
+]
+
+#NOTE: Ollama can also auto-generate tehse schemas if you pass the functions
+# directly as tools (similar to Langchain's @tool decorator).
+# tools_for_llm = [get_product_price, apply_discount]
+# However, this requires your docstrings to follow the Google docstring format
+# docstring format is:
+# """
+# Description of the function
+# Args:
+#   arg1: Description of arg1
+#   arg2: Description of arg2
+# Returns:
+#   Description of the return value
+# """
+# Difference 3: Without LangChain, we must manually trace LLM calls for LangSmith  
+
+@traceable(name="Ollama Chat", run_type="llm")
+def ollama_chat_traed(messages):
+  return ollama.chat(
+    model=MODEL,
+    messages=messages,
+    tools=tools_for_llm,
+  )
+
+
+
+# ---- Agent Loop ----
+
+@traceable(name="Langchain Agent Loop")
+
+def run_agent(query: str) -> str:
+  tools = [get_product_price, apply_discount]
+  tools_dict = {
+    "get_product_price": get_product_price,
+    "apply_discount": apply_discount
+  }
+
+  print(f"Query: {query}")
+  print("="*len(query+"Query: ")+"\n\n")
+
+  messages = [
+    {"role": "system", "content": (
+     
+      "You are a helpful shopping assistant. "
+      "You have access to a product catalog tool "
+      "and a discount tool. \n\n"
+      "STRICT RULES - You must follow these rules extactly:\n"
+      "1. NEVER guess or assume any product prices."
+      "You MUST call get_product_price first to get the real price. \n "
+      "2. Only call apply_discount AFTER you have received"
+      "a price from get_product_price. Pass the exact price"
+      "returned by get_product_price - do NOT pass a made-up number. \n"
+      "3. NEVER calculate discounts yourself using math."
+      "Always apply the discount using the apply_discount tool."
+      "4. If the user does not specify a discount tier,"
+      "ask them which discount tier to use - do NOT assume one."
+     )
+    },
+    {"role": "user", "content": query}
+  ]
+
+  for iteration in range(1, MAX_ITERATIONS+1):
+    print(f"Iteration {iteration}")
+    
+    #Difference 5: ollama.chat() directly instead of llm_with_tools.invoke()
+    response = ollama_chat_traed(messages=messages)
+    ai_message = response.message
+
+    tool_calls = ai_message.tool_calls
+
+    # If no further tool calls, this is our final response
+    if not tool_calls:
+      print(f"\nFinal response: {ai_message.content}")
+      return ai_message.content
+
+    # Process only the FIRST tool call - force one tool per iteration
+    tool_call = tool_calls[0]
+    #Difference 6: Attribute access (.function.name) instead of .get("name")
+    tool_name = tool_call.function.name
+    tool_args = tool_call.function.arguments
+    
+    print(f" [Tool Selected] {tool_name} with args: {tool_args}")
+    tool_to_use = tools_dict.get(tool_name)
+    if not tool_to_use:
+      raise ValueError(f"Tool {tool_name} not found in tools_dict")
+    
+    #Difference 7: Direct function call instead of tool_to_use.invoke()
+    observation = tool_to_use(**tool_args)
+
+    print(f" [Tool Result] {observation}")
+
+    messages.append(ai_message)
+    messages.append({
+      "role": "tool",
+      "content": str(observation),
+    })
+
+  print("ERROR: Max iterations reached without a final response.")
+  return None
+
+    
+    
+  response = llm_with_tools.invoke(messages)
+  print(response.content)
+  print()
+  print("="*len(response.content+"Response: ")+"\n\n")
+  return response.content
+
+
+# ---- Main ----
+if __name__ == "__main__":
+  print("Hello Langchain Agent (.bind_tools()) calling tools...")
+  print()
+  result = run_agent("What is the price of a laptop after applying a gold discount?")
